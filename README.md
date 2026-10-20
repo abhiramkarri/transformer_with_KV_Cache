@@ -32,8 +32,30 @@ python benchmark.py
 
 ## Results
 
-_Fill in after running `benchmark.py` on a Colab T4: table, graph, and what surprised you._
+Setup: Colab T4, fp32, 6 layers, 8 heads, d_model 512, prompt length 32, greedy decoding. Throughput in tokens/sec (batch × new tokens / time).
+
+**With KV cache**
+
+| new tokens | batch 1 | batch 8 | batch 32 |
+|---|---|---|---|
+| 32 | 414 | 2,828 | 7,531 |
+| 64 | 411 | 2,940 | 10,105 |
+| 128 | 401 | 3,057 | 9,011 |
+| 256 | 398 | 2,684 | 6,899 |
+| 512 | 408 | 2,661 | 4,491 |
+
+**Speedup over no cache (same batch)**
+
+| new tokens | batch 1 | batch 8 | batch 32 |
+|---|---|---|---|
+| 32 | 1.1x | 2.2x | 4.5x |
+| 128 | 1.1x | 3.8x | 10.8x |
+| 512 | 1.9x | 9.8x | 18.5x |
 
 ## Findings and tradeoffs
 
-_Write these as you go: memory growth of the cache vs. sequence length, why decode is memory-bound, where speedup flattens._
+1. **Batch 1 is overhead-bound.** Cached throughput is flat at about 400 tok/s regardless of length (about 2.5 ms per step). The model is too small to keep the GPU busy, so Python and kernel-launch overhead dominate, and the cache helps little (1.1x) until sequences get long.
+2. **Batching amortizes that overhead.** Batch 8 gives about 7x the throughput of batch 1 and batch 32 peaks at about 25x (10.1k tok/s), for nearly the same per-step latency at short lengths.
+3. **The cache speedup grows with batch size and sequence length** (up to 18.5x at batch 32, 512 tokens), because recomputing the full sequence costs more as both grow.
+4. **At large batch, cached throughput falls as sequences grow** (10.1k to 4.5k tok/s at batch 32). Working hypothesis: the cache costs 24 KB per token (2 x 6 layers x 512 x 4 bytes), so batch 32 at ~550 tokens holds about 430 MB, and every step both copies it (`torch.cat`) and reads it for attention. Decode becomes memory-bandwidth-bound. Phase 2 tests this by removing the copies with a preallocated cache.
+
