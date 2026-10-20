@@ -1,8 +1,12 @@
 """A minimal GPT-style decoder-only transformer with an explicit KV cache.
 
-The cache is a list with one (k, v) tuple per layer, each of shape
-(batch, n_head, seq_len, head_dim). It grows by concatenation on every step.
-(Phase 2 replaces this with a preallocated cache.)
+Two cache styles are supported:
+
+* "cat" cache (`past_kvs`): a list with one (k, v) tuple per layer, each of shape
+  (batch, n_head, seq_len, head_dim). It grows by `torch.cat` on every step, which
+  allocates and copies the whole cache each time.
+* static cache (`cache=KVCache(...)`): one preallocated buffer. New keys/values are
+  written in place and attention reads a view of the filled part. No per-step copies.
 """
 from dataclasses import dataclass
 
@@ -20,6 +24,34 @@ class GPTConfig:
     n_embd: int = 512
 
 
+class KVCache:
+    """Preallocated KV cache: tensors of shape (n_layer, batch, n_head, max_len, head_dim)."""
+
+    def __init__(self, cfg: GPTConfig, batch_size, max_len, device="cpu", dtype=torch.float32):
+        head_dim = cfg.n_embd // cfg.n_head
+        shape = (cfg.n_layer, batch_size, cfg.n_head, max_len, head_dim)
+        self.k = torch.empty(shape, device=device, dtype=dtype)
+        self.v = torch.empty(shape, device=device, dtype=dtype)
+        self.max_len = max_len
+        self.length = 0  # number of positions already filled
+
+    def update(self, layer, k_new, v_new):
+        """Write new K/V for `layer` at the current position; return views of the filled part."""
+        T = k_new.size(2)
+        start = self.length
+        assert start + T <= self.max_len, "KVCache is full"
+        self.k[layer, :, :, start : start + T] = k_new
+        self.v[layer, :, :, start : start + T] = v_new
+        return self.k[layer, :, :, : start + T], self.v[layer, :, :, : start + T]
+
+    def advance(self, T):
+        """Call once per forward pass, after every layer has written its K/V."""
+        self.length += T
+
+    def nbytes(self):
+        return self.k.numel() * self.k.element_size() * 2
+
+
 class CausalSelfAttention(nn.Module):
     def __init__(self, cfg: GPTConfig):
         super().__init__()
@@ -28,7 +60,7 @@ class CausalSelfAttention(nn.Module):
         self.qkv = nn.Linear(cfg.n_embd, 3 * cfg.n_embd)
         self.proj = nn.Linear(cfg.n_embd, cfg.n_embd)
 
-    def forward(self, x, past_kv=None):
+    def forward(self, x, past_kv=None, cache=None, layer_idx=0):
         B, T, C = x.shape
         q, k, v = self.qkv(x).split(C, dim=2)
         # (B, T, C) -> (B, n_head, T, head_dim)
@@ -37,12 +69,18 @@ class CausalSelfAttention(nn.Module):
         v = v.view(B, T, self.n_head, -1).transpose(1, 2)
 
         past_len = 0
-        if past_kv is not None:
+        present = None
+        if cache is not None:
+            past_len = cache.length
+            k, v = cache.update(layer_idx, k, v)
+        elif past_kv is not None:
             past_k, past_v = past_kv
             past_len = past_k.size(2)
             k = torch.cat([past_k, k], dim=2)
             v = torch.cat([past_v, v], dim=2)
-        present = (k, v)
+            present = (k, v)
+        else:
+            present = (k, v)
 
         if past_len == 0:
             y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
@@ -71,8 +109,8 @@ class Block(nn.Module):
             nn.Linear(4 * cfg.n_embd, cfg.n_embd),
         )
 
-    def forward(self, x, past_kv=None):
-        a, present = self.attn(self.ln1(x), past_kv)
+    def forward(self, x, past_kv=None, cache=None, layer_idx=0):
+        a, present = self.attn(self.ln1(x), past_kv, cache, layer_idx)
         x = x + a
         x = x + self.mlp(self.ln2(x))
         return x, present
@@ -97,24 +135,36 @@ class GPT(nn.Module):
             if isinstance(m, nn.Linear) and m.bias is not None:
                 nn.init.zeros_(m.bias)
 
-    def forward(self, idx, past_kvs=None, last_only=False):
+    def forward(self, idx, past_kvs=None, cache=None, last_only=False):
         """idx: (B, T) token ids. Returns (logits, presents).
 
-        past_kvs: cache from a previous call, or None. With a cache, idx holds
-        only the NEW tokens and positions continue from the cached length.
+        past_kvs: "cat" cache from a previous call, or None.
+        cache: a preallocated KVCache (updated in place; `presents` is then None).
+        With either cache, idx holds only the NEW tokens and positions continue
+        from the cached length.
         last_only: compute logits for the final position only (saves work in decoding).
         """
+        assert past_kvs is None or cache is None, "use either past_kvs or cache, not both"
         B, T = idx.shape
-        past_len = past_kvs[0][0].size(2) if past_kvs is not None else 0
+        if cache is not None:
+            past_len = cache.length
+        elif past_kvs is not None:
+            past_len = past_kvs[0][0].size(2)
+        else:
+            past_len = 0
         assert past_len + T <= self.cfg.block_size, "sequence exceeds block_size"
 
         pos = torch.arange(past_len, past_len + T, device=idx.device)
         x = self.tok_emb(idx) + self.pos_emb(pos)
 
-        presents = []
+        presents = [] if cache is None else None
         for i, block in enumerate(self.blocks):
-            x, present = block(x, None if past_kvs is None else past_kvs[i])
-            presents.append(present)
+            past = None if past_kvs is None else past_kvs[i]
+            x, present = block(x, past, cache, i)
+            if presents is not None:
+                presents.append(present)
+        if cache is not None:
+            cache.advance(T)
 
         x = self.ln_f(x)
         if last_only:

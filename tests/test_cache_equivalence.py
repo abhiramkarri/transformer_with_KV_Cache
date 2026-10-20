@@ -1,6 +1,6 @@
 import torch
 
-from kvcache import GPT, GPTConfig, generate
+from kvcache import GPT, GPTConfig, KVCache, generate
 
 
 def make_model():
@@ -40,3 +40,41 @@ def test_generate_same_with_and_without_cache():
     a = generate(model, prompt, max_new_tokens=16, use_cache=True)
     b = generate(model, prompt, max_new_tokens=16, use_cache=False)
     assert torch.equal(a, b)
+
+
+def test_static_cache_logits_match_full_forward():
+    model = make_model()
+    idx = torch.randint(0, 100, (2, 20))
+    with torch.no_grad():
+        full, _ = model(idx)
+        cache = KVCache(model.cfg, batch_size=2, max_len=32)
+        model(idx[:, :12], cache=cache)
+        assert cache.length == 12
+        steps = []
+        for t in range(12, 20):
+            logits, _ = model(idx[:, t : t + 1], cache=cache)
+            steps.append(logits)
+        assert cache.length == 20
+        cached = torch.cat(steps, dim=1)
+    assert torch.allclose(full[:, 12:], cached, atol=1e-4)
+
+
+def test_static_cache_multi_token_chunk():
+    model = make_model()
+    idx = torch.randint(0, 100, (1, 20))
+    with torch.no_grad():
+        full, _ = model(idx)
+        cache = KVCache(model.cfg, batch_size=1, max_len=20)
+        model(idx[:, :10], cache=cache)
+        chunk, _ = model(idx[:, 10:], cache=cache)
+    assert torch.allclose(full[:, 10:], chunk, atol=1e-4)
+
+
+def test_generate_static_matches_cat_and_no_cache():
+    model = make_model()
+    prompt = torch.randint(0, 100, (2, 8))
+    static = generate(model, prompt, max_new_tokens=16, use_cache=True, static_cache=True)
+    cat = generate(model, prompt, max_new_tokens=16, use_cache=True)
+    none = generate(model, prompt, max_new_tokens=16, use_cache=False)
+    assert torch.equal(static, cat)
+    assert torch.equal(static, none)

@@ -8,10 +8,10 @@ Autoregressive decoding generates one token at a time. Without a cache, every st
 
 ## Layout
 
-- `kvcache/model.py`: transformer with `past_kvs` support
-- `kvcache/generate.py`: greedy decoding with and without the cache
+- `kvcache/model.py`: transformer, `past_kvs` (cat) cache, and preallocated `KVCache`
+- `kvcache/generate.py`: greedy decoding: no cache, cat cache, or static cache
 - `tests/`: cached and uncached outputs must match
-- `benchmark.py`: tokens/sec with vs. without cache
+- `benchmark.py`: tokens/sec and peak GPU memory for no cache vs. cat cache vs. static cache
 - `notebooks/`: Colab quickstart
 
 ## Run
@@ -25,7 +25,7 @@ python benchmark.py
 ## Roadmap
 
 - [x] Phase 1: model, KV cache, equivalence tests, benchmark
-- [ ] Phase 2: preallocated static cache (avoid `torch.cat` copies), measure memory
+- [ ] Phase 2: preallocated static cache (avoid `torch.cat` copies), measure memory. Implemented and tested; benchmark results pending (see Phase 2 section)
 - [ ] Phase 3: batched decoding, then continuous batching
 - [ ] Phase 4: sampling (temperature, top-k/top-p), fp16, quantization
 - [ ] Phase 5: compare against Hugging Face and vLLM on the same model
@@ -59,3 +59,9 @@ Setup: Colab T4, fp32, 6 layers, 8 heads, d_model 512, prompt length 32, greedy 
 3. **The cache speedup grows with batch size and sequence length** (up to 18.5x at batch 32, 512 tokens), because recomputing the full sequence costs more as both grow.
 4. **At large batch, cached throughput falls as sequences grow** (10.1k to 4.5k tok/s at batch 32). Working hypothesis: the cache costs 24 KB per token (2 x 6 layers x 512 x 4 bytes), so batch 32 at ~550 tokens holds about 430 MB, and every step both copies it (`torch.cat`) and reads it for attention. Decode becomes memory-bandwidth-bound. Phase 2 tests this by removing the copies with a preallocated cache.
 
+
+## Phase 2: static (preallocated) cache
+
+Hypothesis from Phase 1: at large batch and long sequences, `torch.cat` copies the whole cache every step, so throughput falls as sequences grow. The static cache allocates `(n_layer, batch, n_head, max_len, head_dim)` once, writes each new K/V in place, and attention reads a view of the filled part.
+
+_Results pending: run `python benchmark.py --batch 32` on a T4 and fill in the table (tok/s and peak MB for no cache, cat, static). If throughput at 512 tokens recovers, the copies were a large part of the cost; whatever gap remains is attention reading the cache, which is memory-bound._
